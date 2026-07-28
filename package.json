@@ -1,6 +1,6 @@
 {
   "name": "channel-sentinel",
-  "version": "2.0.0",
+  "version": "2.0.1",
   "description": "Channel Monitoring & Status Guardian Platform",
   "license": "MIT",
   "main": "src/index.js",
