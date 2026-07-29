@@ -6,6 +6,7 @@ server_error.log
 server.log
 captcha.svg
 cookies.txt
+service-gate-summary.json
 
 cloudflare-worker/index.js
 test_temp/
