@@ -3,8 +3,6 @@ const crypto = require('crypto');
 const exportService = require('../services/export');
 const config = require('../config');
 const logger = require('../core/logger');
-const streamsReader = require('../storage/streams-reader');
-const configReader = require('../storage/config-reader');
 const { wrapAsync } = require('../middleware/governance');
 
 const router = express.Router();
@@ -91,30 +89,20 @@ function validateExportToken(req, res, next) {
 }
 
 async function getStreamsForExport() {
-    const streams = config.getConfig('streams').streams || [];
-    return streamsReader.loadStreamsFallback(streams);
+    // P1优化：直接使用内存中的 streams，避免每次导出都查 SQLite
+    const streamsCfg = config.getConfig('streams') || {};
+    return Array.isArray(streamsCfg.streams) ? streamsCfg.streams : [];
 }
 
 async function hydrateExportConfigs() {
+    // P0优化：配置在服务启动时已从 SQLite hydrate 到内存（见 index.js bootstrap）
+    // 导出时直接使用内存配置，无需每次都串行查 5 次 SQLite
+    // 仅确保 appSettings 中的敏感字段已解密
     try {
-        const appSettings = await configReader.loadAppSettingsFallback(config.getConfig('appSettings') || {});
-        config.updateConfig('appSettings', appSettings || {});
-    } catch (e) {}
-    try {
-        const proxyCfg = await configReader.loadProxyServersFallback(config.getConfig('proxyServers') || { list: [] });
-        config.updateConfig('proxyServers', proxyCfg || { list: [] });
-    } catch (e) {}
-    try {
-        const udpxyCfg = await configReader.loadUdpxyServersFallback(config.getConfig('udpxyServers') || { servers: [], currentId: '' });
-        config.updateConfig('udpxyServers', udpxyCfg || { servers: [], currentId: '' });
-    } catch (e) {}
-    try {
-        const logoCfg = await configReader.loadLogoTemplatesFallback(config.getConfig('logoTemplates') || { templates: [], currentId: '' });
-        config.updateConfig('logoTemplates', logoCfg || { templates: [], currentId: '' });
-    } catch (e) {}
-    try {
-        const epgCfg = await configReader.loadEpgSourcesFallback(config.getConfig('epgSources') || { sources: [] });
-        config.updateConfig('epgSources', epgCfg || { sources: [] });
+        const appSettings = config.getConfig('appSettings') || {};
+        if (typeof appSettings.securityToken === 'string') {
+            appSettings.securityToken = unwrapSecret(appSettings.securityToken);
+        }
     } catch (e) {}
 }
 

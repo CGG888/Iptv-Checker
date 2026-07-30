@@ -184,6 +184,33 @@ class ReplayRulesStateManager {
         return entry;
     }
 
+    /**
+     * 批量记录命中日志，仅写一次磁盘
+     * @param {Array} hits 命中记录数组
+     */
+    trackHitsBatch(hits) {
+        if (!Array.isArray(hits) || hits.length === 0) return;
+        const state = this.ensureStateInitialized();
+        const now = new Date().toISOString();
+        for (const input of hits) {
+            const entry = {
+                at: now,
+                type: String(input.type || 'unknown'),
+                scope: String(input.scope || ''),
+                fmt: String(input.fmt || ''),
+                proto: String(input.proto || ''),
+                baseRuleId: String(input.baseRuleId || ''),
+                timeRuleId: String(input.timeRuleId || ''),
+                hitSource: String(input.hitSource || ''),
+                success: input.success !== false,
+                errorCode: String(input.errorCode || '')
+            };
+            state.hitLogs.unshift(entry);
+        }
+        if (state.hitLogs.length > this.maxHitLogs) state.hitLogs = state.hitLogs.slice(0, this.maxHitLogs);
+        this.saveState(state);
+    }
+
     getHitLogs(limit = 100) {
         const state = this.ensureStateInitialized();
         const n = Math.max(1, Math.min(Number(limit || 100), this.maxHitLogs));

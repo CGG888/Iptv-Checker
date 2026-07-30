@@ -110,21 +110,17 @@ class ExportService {
      * @param {string} name 名称
      * @param {string} resolution 分辨率
      * @param {string} frameRate 帧率
+     * @param {Map|null} unicastIndex 预构建的单播索引（可选，避免O(n²)）
      * @returns {Object|null} 匹配的流
      */
-    findUnicastMatchByMeta(name, resolution, frameRate) {
+    findUnicastMatchByMeta(name, resolution, frameRate, unicastIndex) {
         const nm = String(name || '').trim();
         const rs = String(resolution || '').trim();
         const frStr = String(frameRate || '').trim();
         const frNum = frStr ? (parseFloat(frStr) || null) : null;
-        const streamsCfg = config.getConfig('streams') || {};
-        const list = Array.isArray(streamsCfg.streams) ? streamsCfg.streams : [];
-        const candidates = list.filter(x => this.isHttpUrl(x.multicastUrl));
-        
-        const fullNameEq = (x) => String(x.tvgName || x.name || '').trim() === nm;
+
         const normalizeName = (s) => String(s || '').trim().replace(/\s+/g, '').replace(/4K$/i, '');
         const nmBase = normalizeName(nm);
-        const fullNameBaseEq = (x) => normalizeName(String(x.tvgName || x.name || '').trim()) === nmBase;
         const eqRes = (x) => String(x.resolution || '').trim() === rs;
         const eqFps = (x) => {
             const xf = String(x.frameRate || '').trim();
@@ -142,27 +138,38 @@ class ExportService {
             if (isNaN(w) || isNaN(h)) return 0;
             return w * h;
         };
-        
-        let nameCandidates = candidates.filter(fullNameEq);
-        if (nameCandidates.length === 0) {
-            nameCandidates = candidates.filter(fullNameBaseEq);
+
+        let nameCandidates;
+        if (unicastIndex instanceof Map) {
+            nameCandidates = unicastIndex.get(nm) || unicastIndex.get(nmBase) || [];
+            if (nameCandidates.length === 0) return null;
+        } else {
+            const streamsCfg = config.getConfig('streams') || {};
+            const list = Array.isArray(streamsCfg.streams) ? streamsCfg.streams : [];
+            const candidates = list.filter(x => this.isHttpUrl(x.multicastUrl));
+            const fullNameEq = (x) => String(x.tvgName || x.name || '').trim() === nm;
+            const fullNameBaseEq = (x) => normalizeName(String(x.tvgName || x.name || '').trim()) === nmBase;
+            nameCandidates = candidates.filter(fullNameEq);
+            if (nameCandidates.length === 0) {
+                nameCandidates = candidates.filter(fullNameBaseEq);
+            }
+            if (nameCandidates.length === 0) return null;
         }
-        if (nameCandidates.length === 0) return null;
-        
+
         const exactRF = nameCandidates.filter(x => eqRes(x) && eqFps(x));
         if (exactRF.length > 0) return exactRF[0];
-        
+
         const exactR = nameCandidates.filter(x => eqRes(x));
         if (exactR.length > 0) {
             const withFps = exactR.filter(x => eqFps(x));
             if (withFps.length > 0) return withFps[0];
             return exactR[0];
         }
-        
+
         const is4k = rs === '3840x2160';
         const fourK = nameCandidates.filter(x => String(x.resolution || '').trim() === '3840x2160');
         const withFps = nameCandidates.filter(x => eqFps(x));
-        
+
         if (is4k) {
             if (withFps.length > 0) {
                 const fourKFps = withFps.filter(x => String(x.resolution || '').trim() === '3840x2160');
@@ -181,6 +188,29 @@ class ExportService {
             const sorted = [...nameCandidates].sort((a, b) => areaOf(b.resolution) - areaOf(a.resolution));
             return sorted[0];
         }
+    }
+
+    /**
+     * 预构建单播流索引 Map，避免导出时 O(n²) 遍历
+     * key: 频道名称（原始 & 归一化），value: 单播流候选数组
+     * @returns {Map} 单播索引
+     */
+    buildUnicastIndex() {
+        const streamsCfg = config.getConfig('streams') || {};
+        const list = Array.isArray(streamsCfg.streams) ? streamsCfg.streams : [];
+        const candidates = list.filter(x => this.isHttpUrl(x.multicastUrl));
+        const normalizeName = (s) => String(s || '').trim().replace(/\s+/g, '').replace(/4K$/i, '');
+        const index = new Map();
+        for (const x of candidates) {
+            const fullName = String(x.tvgName || x.name || '').trim();
+            const baseName = normalizeName(fullName);
+            for (const key of [fullName, baseName]) {
+                if (!key) continue;
+                if (!index.has(key)) index.set(key, []);
+                index.get(key).push(x);
+            }
+        }
+        return index;
     }
 
     /**
@@ -486,6 +516,7 @@ class ExportService {
     generateM3uExport(streams, options = {}) {
         const { scope = 'internal', status = 'all', fmt = 'default', proto = 'http', stripSuffix = false } = options;
         const noSuffix = (fmt === 'default') || stripSuffix;
+        this.settings = config.getConfig('appSettings');
         const udpxyCfg = config.getConfig('udpxyServers');
         const udpxyServers = Array.isArray(udpxyCfg.servers) ? udpxyCfg.servers : [];
         const appSettings = config.getConfig('appSettings') || {};
@@ -515,6 +546,12 @@ class ExportService {
         
         const filtered = this.filterByStatus(streams, status);
         const ordered = this.sortStreamsForExport(filtered);
+
+        // P0优化：预构建单播索引，将 O(n²) 匹配降为 O(n) + O(1) 查找
+        const unicastIndex = this.buildUnicastIndex();
+        // P1优化：批量收集 hit 记录，结束后一次性写入
+        const pendingHits = [];
+        const isDefaultFmt = String(fmt || '').toLowerCase() === 'default';
         
         const epgHeaderUrl = pickEpg ? pickEpg.url : '';
         const head = '#EXTM3U' + (epgHeaderUrl ? (' x-tvg-url="' + epgHeaderUrl + '"') : '') + '\r\n';
@@ -569,7 +606,7 @@ class ExportService {
             if (!isMulticast) {
                 unicastBase = this.resolveReplayBaseByLiveUrl(scope, s.multicastUrl || '', proto);
             } else {
-                const match = this.findUnicastMatchByMeta(s.tvgName || s.name || '', s.resolution || '', s.frameRate);
+                const match = this.findUnicastMatchByMeta(s.tvgName || s.name || '', s.resolution || '', s.frameRate, unicastIndex);
                 if (match && this.isHttpUrl(match.multicastUrl)) {
                     unicastBase = this.resolveReplayBaseByLiveUrl(scope, match.multicastUrl || '', proto);
                 }
@@ -589,13 +626,18 @@ class ExportService {
             }
             
             if (!catchupAttr && unicastBase) {
-                catchupAttr = this.generateCatchupAttribute(unicastBase, fmt, proto);
+                catchupAttr = this.generateCatchupAttribute(unicastBase, fmt, proto, pendingHits, isDefaultFmt);
             }
             
             const line1 = `#EXTINF:-1 tvg-id="${tvgId}" tvg-name="${tvgName}" tvg-logo="${tvgLogo}" group-title="${groupTitle}"${catchupAttr},${this.exportChannelName(s)}`;
             return `${line1}\r\n${httpUrl}`;
         }).filter(Boolean).join('\r\n');
-        
+
+        // P1优化：批量 flush hit 记录，一次写入而非每频道写一次
+        if (pendingHits && pendingHits.length > 0) {
+            replayRules.trackHitsBatch(pendingHits);
+        }
+
         return head + body;
     }
 
@@ -603,9 +645,12 @@ class ExportService {
      * 生成回放属性
      * @param {string} unicastBase 单播基础URL
      * @param {string} fmt 回放格式
+     * @param {string} proto 协议
+     * @param {Array} pendingHits 批量收集的命中记录数组（可选）
+     * @param {boolean} isDefaultFmt 是否为默认格式（跳过hit记录）
      * @returns {string} 回放属性字符串
      */
-    generateCatchupAttribute(unicastBase, fmt, proto = 'http') {
+    generateCatchupAttribute(unicastBase, fmt, proto = 'http', pendingHits, isDefaultFmt) {
         if (String(fmt || '').toLowerCase() === 'default') return '';
         const built = replayRules.buildCatchupSourceTemplate({
             baseUrl: unicastBase,
@@ -613,24 +658,28 @@ class ExportService {
             proto
         });
         if (!built.success || !built.source) {
-            replayRules.trackHit({
+            if (pendingHits && !isDefaultFmt) {
+                pendingHits.push({
+                    type: 'export_m3u',
+                    scope: '',
+                    fmt,
+                    proto,
+                    success: false,
+                    errorCode: built.errorCode || ''
+                });
+            }
+            return '';
+        }
+        if (pendingHits && !isDefaultFmt) {
+            pendingHits.push({
                 type: 'export_m3u',
                 scope: '',
                 fmt,
                 proto,
-                success: false,
-                errorCode: built.errorCode || ''
+                timeRuleId: built.timeRuleId || '',
+                success: true
             });
-            return '';
         }
-        replayRules.trackHit({
-            type: 'export_m3u',
-            scope: '',
-            fmt,
-            proto,
-            timeRuleId: built.timeRuleId || '',
-            success: true
-        });
         return ` catchup="default" catchup-source="${built.source}"`;
     }
 

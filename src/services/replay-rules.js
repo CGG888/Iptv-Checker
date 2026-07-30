@@ -10,9 +10,13 @@ class ReplayRulesService {
         this.cache = {
             base: null,
             baseMtime: 0,
+            baseCheckedAt: 0,
             time: null,
-            timeMtime: 0
+            timeMtime: 0,
+            timeCheckedAt: 0
         };
+        // P2优化：stat 检查间隔（ms），避免高频系统调用
+        this.statIntervalMs = 5000;
         this.stateManager = new ReplayRulesStateManager({
             baseRulesPath: this.baseRulesPath,
             timeRulesPath: this.timeRulesPath,
@@ -22,15 +26,25 @@ class ReplayRulesService {
     }
 
     loadJson(filePath) {
-        const st = fs.statSync(filePath);
-        const mtime = Number(st.mtimeMs || 0);
+        const now = Date.now();
         const isBase = filePath === this.baseRulesPath;
         const key = isBase ? 'base' : 'time';
         const mKey = isBase ? 'baseMtime' : 'timeMtime';
-        if (this.cache[key] && this.cache[mKey] === mtime) return this.cache[key];
+        const checkedKey = isBase ? 'baseCheckedAt' : 'timeCheckedAt';
+        // P2优化：在 statIntervalMs 内跳过 statSync，直接用缓存
+        if (this.cache[key] && (now - this.cache[checkedKey]) < this.statIntervalMs) {
+            return this.cache[key];
+        }
+        const st = fs.statSync(filePath);
+        const mtime = Number(st.mtimeMs || 0);
+        if (this.cache[key] && this.cache[mKey] === mtime) {
+            this.cache[checkedKey] = now;
+            return this.cache[key];
+        }
         const obj = JSON.parse(fs.readFileSync(filePath, 'utf8'));
         this.cache[key] = obj;
         this.cache[mKey] = mtime;
+        this.cache[checkedKey] = now;
         return obj;
     }
 
@@ -45,8 +59,10 @@ class ReplayRulesService {
     resetCache() {
         this.cache.base = null;
         this.cache.baseMtime = 0;
+        this.cache.baseCheckedAt = 0;
         this.cache.time = null;
         this.cache.timeMtime = 0;
+        this.cache.timeCheckedAt = 0;
     }
 
     getStatus() {
@@ -67,6 +83,10 @@ class ReplayRulesService {
 
     trackHit(input = {}) {
         return this.stateManager.trackHit(input);
+    }
+
+    trackHitsBatch(hits) {
+        return this.stateManager.trackHitsBatch(hits);
     }
 
     getHitLogs(limit = 100) {
